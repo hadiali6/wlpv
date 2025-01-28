@@ -3,17 +3,19 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
+
+	"github.com/hadiali6/wl-protocol-viewer/gitlab"
+	"github.com/hadiali6/wl-protocol-viewer/offline"
+	"github.com/hadiali6/wl-protocol-viewer/util"
 )
 
 const help = `usage: wl-protocol-viewer [options] [additional xml protocol file(s)]
 
     -h -help    Print this help message and exit.
     -v -version Print the version number and exit.
-    -no-system  Disable usage of protocols found in /usr/share/*.
+    -offline    Search for protocols found in /usr/share/* instead of fetching from git
 `
 
 const version = "0.0.1"
@@ -29,7 +31,7 @@ func main() {
 	shortVersionFlag := flag.Bool("v", false, "")
 	longVersionFlag := flag.Bool("version", false, "")
 
-	noSystemFlag := flag.Bool("no-system", false, "")
+	offlineFlag := flag.Bool("offline", false, "")
 
 	flag.Parse()
 
@@ -43,103 +45,198 @@ func main() {
 		os.Exit(0)
 	}
 
-	protocolFiles := flag.Args()
-
-	for _, protocolFile := range protocolFiles {
-		fmt.Printf("%s\n", protocolFile)
-	}
-
-	var xmlProtocolFiles []string
-
-	const usrshare = "/usr/share/"
-	const wl = "wayland"
-	const ext = "wayland-protocols"
-	const wlr = "wlr-protocols"
-	const kde = "plasma-wayland-protocols"
-	const weston = "libweston*"
-
-	if *noSystemFlag {
-		fmt.Println("no system")
-	} else {
-		wl_xml, err := findAllFiles(usrshare+wl, ".xml")
-		if err == nil {
-			xmlProtocolFiles = append(xmlProtocolFiles, wl_xml...)
-		}
-
-		ext_xml, err := findAllFiles(usrshare+ext, ".xml")
-		if err == nil {
-			xmlProtocolFiles = append(xmlProtocolFiles, ext_xml...)
-		}
-
-		wlr_xml, err := findAllFiles(usrshare+wlr, ".xml")
-		if err == nil {
-			xmlProtocolFiles = append(xmlProtocolFiles, wlr_xml...)
-		}
-
-		kde_xml, err := findAllFiles(usrshare+kde, ".xml")
-		if err == nil {
-			xmlProtocolFiles = append(xmlProtocolFiles, kde_xml...)
-		}
-
-		westonPathMatches, _ := findMatchingDirs(usrshare + weston)
-
-		weston_xml, err := findAllFiles(westonPathMatches[0], ".xml")
-		if err == nil {
-			xmlProtocolFiles = append(xmlProtocolFiles, weston_xml...)
-		}
-	}
-
-	fmt.Println(xmlProtocolFiles)
-
-}
-
-func dirExists(path string) (bool, error) {
-	info, err := os.Stat(path)
-	if os.IsNotExist(err) {
-		return false, nil
-	}
+	allProtocolFiles := GetProtocolFilesToRead(flag.Args(), *offlineFlag)
+	xmlFileContents, err := util.ReadAllFiles(allProtocolFiles)
 	if err != nil {
-		return false, err
+		fmt.Fprintf(os.Stderr, "Error reading file: %s\n", err.Error())
+		os.Exit(1)
 	}
 
-	return info.IsDir(), nil
-}
-
-func findAllFiles(path string, extension string) ([]string, error) {
-	var xmlFiles []string
-
-	err := filepath.WalkDir(path, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return fmt.Errorf("error: accessing path of %s %w\n", path, err)
-		}
-
-		if !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), extension) {
-			xmlFiles = append(xmlFiles, path)
-		}
-
-		return nil
-	})
-
-	return xmlFiles, err
-}
-
-func findMatchingDirs(patternPath string) ([]string, error) {
-	matches, err := filepath.Glob(patternPath)
+	xmlNetContents, err := GetProtocolsFromInternet()
 	if err != nil {
-		return nil, fmt.Errorf("error while matching pattern: %w", err)
+		fmt.Fprintf(os.Stderr, "Error getting protocol from the internet: %s\n", err.Error())
+		os.Exit(1)
 	}
 
-	var dirs []string
-	for _, match := range matches {
-		info, err := os.Stat(match)
+	xmlFileContents = append(xmlFileContents, xmlNetContents...)
+
+	for _, file := range xmlFileContents {
+		println(file)
+	}
+}
+
+func GetProtocolsFromInternet() ([]string, error) {
+	var contents []string
+
+	{
+		var wayland = gitlab.UrlConfig{
+			Origin:     "https://gitlab.freedesktop.org",
+			Namespace:  "wayland",
+			Repository: "wayland",
+			Branch:     "main",
+			UrlType:    gitlab.UrlTypeFiles,
+			Path:       "protocol/wayland.xml",
+		}
+
+		waylandResp, err := wayland.Get()
 		if err != nil {
-			return nil, fmt.Errorf("error while checking path %q: %w", match, err)
+			return nil, err
+		}
+		defer waylandResp.Body.Close()
+
+		content, err := wayland.FetchFiles(waylandResp)
+		if err != nil {
+			return nil, err
 		}
 
-		if info.IsDir() {
-			dirs = append(dirs, match)
+		contents = append(contents, content)
+	}
+
+	{
+		var extStable = gitlab.UrlConfig{
+			Origin:     "https://gitlab.freedesktop.org",
+			Namespace:  "wayland",
+			Repository: "wayland-protocols",
+			Branch:     "main",
+			UrlType:    gitlab.UrlTypeTree,
+			Path:       "stable",
+		}
+
+		extStableResp, err := extStable.Get()
+		if err != nil {
+			return nil, err
+		}
+		defer extStableResp.Body.Close()
+
+		content, err := extStable.FetchTree(extStableResp)
+		if err != nil {
+			return nil, err
+		}
+
+		contents = append(contents, content...)
+	}
+
+	{
+		var extStaging = gitlab.UrlConfig{
+			Origin:     "https://gitlab.freedesktop.org",
+			Namespace:  "wayland",
+			Repository: "wayland-protocols",
+			Branch:     "main",
+			UrlType:    gitlab.UrlTypeTree,
+			Path:       "staging",
+		}
+
+		extStagingResp, err := extStaging.Get()
+		if err != nil {
+			return nil, err
+		}
+		defer extStagingResp.Body.Close()
+
+		content, err := extStaging.FetchTree(extStagingResp)
+		if err != nil {
+			return nil, err
+		}
+
+		contents = append(contents, content...)
+	}
+
+	{
+		var extUnstable = gitlab.UrlConfig{
+			Origin:     "https://gitlab.freedesktop.org",
+			Namespace:  "wayland",
+			Repository: "wayland-protocols",
+			Branch:     "main",
+			UrlType:    gitlab.UrlTypeTree,
+			Path:       "unstable",
+		}
+
+		extUnstableResp, err := extUnstable.Get()
+		if err != nil {
+			return nil, err
+		}
+		defer extUnstableResp.Body.Close()
+
+		content, err := extUnstable.FetchTree(extUnstableResp)
+		if err != nil {
+			return nil, err
+		}
+
+		contents = append(contents, content...)
+	}
+
+	return contents, nil
+}
+
+func GetProtocolFilesToRead(filePathsFromArgs []string, getProtocolsFromSystem bool) []string {
+	var allFiles []string
+
+	for _, path := range filePathsFromArgs {
+		matches, err := filepath.Glob(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error matching path '%s'. error: '%s'\n", path, err.Error())
+			os.Exit(1)
+		}
+
+		for _, match := range matches {
+			fileInfo, err := os.Stat(match)
+			if err != nil {
+				if os.IsNotExist(err) {
+					fmt.Fprintf(os.Stderr, "Path '%s' doesn't exist\n", path)
+					os.Exit(1)
+				} else {
+					fmt.Fprintf(
+						os.Stderr,
+						"Error checking path '%s'. error: '%s'\n",
+						path,
+						err.Error(),
+					)
+					os.Exit(1)
+				}
+			}
+
+			if fileInfo.IsDir() {
+				files, err := util.AllFilesInDir(match, ".xml")
+				if err != nil {
+					fmt.Fprintf(
+						os.Stderr,
+						"Error finding all '.xml' files in directory: '%s'. error: '%s'\n",
+						match,
+						err.Error(),
+					)
+					os.Exit(1)
+				}
+
+				allFiles = append(allFiles, files...)
+			} else {
+				if filepath.Ext(match) == ".xml" {
+					allFiles = append(allFiles, match)
+				}
+			}
 		}
 	}
 
-	return dirs, nil
+	if getProtocolsFromSystem {
+		var protocolFiles = offline.FindAllProtocols()
+
+		for _, filePathFromArgs := range allFiles {
+			for index, filePathFromSystem := range protocolFiles {
+				fileFromArgs := filepath.Base(filePathFromArgs)
+				fileFromSystem := filepath.Base(filePathFromSystem)
+
+				if fileFromArgs == fileFromSystem {
+					fmt.Fprintf(
+						os.Stderr,
+						"Duplicate filenames! '%s' '%s'\n",
+						filePathFromArgs,
+						filePathFromSystem,
+					)
+					protocolFiles = util.RemoveAtIndex(protocolFiles, index)
+				}
+			}
+		}
+
+		allFiles = append(allFiles, protocolFiles...)
+	}
+
+	return allFiles
 }
