@@ -59,13 +59,13 @@ func FindMatchingDirs(patternPath string) ([]string, error) {
 	return dirs, nil
 }
 
-func RemoveAtIndex(s []string, i int) []string {
+func RemoveAtIndex(s [][]byte, i int) [][]byte {
 	s[i] = s[len(s)-1]
 	return s[:len(s)-1]
 }
 
-func ReadAllFiles(files []string) ([]string, error) {
-	var contents []string
+func ReadAllFiles(files []string) ([][]byte, error) {
+	var contents [][]byte
 
 	for _, file := range files {
 		data, err := os.ReadFile(file)
@@ -73,7 +73,7 @@ func ReadAllFiles(files []string) ([]string, error) {
 			return nil, err
 		}
 
-		contents = append(contents, string(data))
+		contents = append(contents, data)
 	}
 
 	return contents, nil

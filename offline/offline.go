@@ -1,43 +1,88 @@
 package offline
 
-import "github.com/hadiali6/wl-protocol-viewer/util"
+import (
+	"wlpv/util"
+	"wlpv/xmlparser"
+)
 
 const usrshare = "/usr/share/"
 const wl = "wayland"
-const ext = "wayland-protocols"
+const stable = "wayland-protocols/stable"
+const staging = "wayland-protocols/staging"
+const unstable = "wayland-protocols/unstable"
 const wlr = "wlr-protocols"
 const kde = "plasma-wayland-protocols"
 const weston = "libweston*"
 
-func FindAllProtocols() []string {
-	var xmlProtocolFiles []string
-
-	wl_xml, err := util.AllFilesInDir(usrshare+wl, ".xml")
-	if err == nil {
-		xmlProtocolFiles = append(xmlProtocolFiles, wl_xml...)
+func getProtocolsInDir(path string) ([]xmlparser.Protocol, error) {
+	files, err := util.AllFilesInDir(path, ".xml")
+	if err != nil {
+		return nil, err
 	}
 
-	ext_xml, err := util.AllFilesInDir(usrshare+ext, ".xml")
-	if err == nil {
-		xmlProtocolFiles = append(xmlProtocolFiles, ext_xml...)
+	contents, err := util.ReadAllFiles(files)
+	if err != nil {
+		return nil, err
 	}
 
-	wlr_xml, err := util.AllFilesInDir(usrshare+wlr, ".xml")
-	if err == nil {
-		xmlProtocolFiles = append(xmlProtocolFiles, wlr_xml...)
+	var protocols []xmlparser.Protocol
+	for _, content := range contents {
+		protocols = append(protocols, xmlparser.ParseProtocol(content))
 	}
 
-	kde_xml, err := util.AllFilesInDir(usrshare+kde, ".xml")
-	if err == nil {
-		xmlProtocolFiles = append(xmlProtocolFiles, kde_xml...)
+	return protocols, nil
+}
+
+func GetProtocolContents() (map[string][]xmlparser.Protocol, error) {
+	waylandProtocols, err := getProtocolsInDir(usrshare + wl) // length should only be 1 (only wayland.xml)
+	if err != nil {
+		return nil, err
 	}
 
-	westonPathMatches, _ := util.FindMatchingDirs(usrshare + weston)
-
-	weston_xml, err := util.AllFilesInDir(westonPathMatches[0], ".xml")
-	if err == nil {
-		xmlProtocolFiles = append(xmlProtocolFiles, weston_xml...)
+	stableProtocols, err := getProtocolsInDir(usrshare + stable)
+	if err != nil {
+		return nil, err
 	}
 
-	return xmlProtocolFiles
+	stagingProtocols, err := getProtocolsInDir(usrshare + staging)
+	if err != nil {
+		return nil, err
+	}
+
+	unstableProtocols, err := getProtocolsInDir(usrshare + unstable)
+	if err != nil {
+		return nil, err
+	}
+
+	wlrProtocols, err := getProtocolsInDir(usrshare + wlr)
+	if err != nil {
+		return nil, err
+	}
+
+	kdeProtocols, err := getProtocolsInDir(usrshare + kde)
+	if err != nil {
+		return nil, err
+	}
+
+	westonPathMatches, err := util.FindMatchingDirs(usrshare + weston)
+	if err != nil {
+		return nil, err
+	}
+
+	westonProtocols, err := getProtocolsInDir(westonPathMatches[0])
+	if err != nil {
+		return nil, err
+	}
+
+	var result = map[string][]xmlparser.Protocol{
+		"core":     waylandProtocols,
+		"stable":   stableProtocols,
+		"staging":  stagingProtocols,
+		"unstable": unstableProtocols,
+		"wlroots":  wlrProtocols,
+		"weston":   westonProtocols,
+		"kde":      kdeProtocols,
+	}
+
+	return result, nil
 }

@@ -6,13 +6,20 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sync"
+	"wlpv/xmlparser"
 )
 
-type FileResponse struct {
+type FetchResult struct {
+	Namespace string
+	Protocols []xmlparser.Protocol
+}
+
+type fileResponse struct {
 	Content string `json:"content"`
 }
 
-type TreeResponse struct {
+type treeResponse struct {
 	Path string `json:"path"`
 	Type string `json:"type"`
 }
@@ -33,115 +40,127 @@ type UrlConfig struct {
 	UrlType
 }
 
-func (uc UrlConfig) ToUrl() (urlstr string, err error) {
+func (u UrlConfig) url() string {
 	base := fmt.Sprintf("%s/api/v4/projects/%s%%2F%s/repository",
-		uc.Origin,
-		uc.Namespace,
-		uc.Repository,
+		u.Origin,
+		u.Namespace,
+		u.Repository,
 	)
 
-	var result string
+	formattedPath := url.PathEscape(u.Path)
 
-	formattedPath := url.PathEscape(uc.Path)
-	switch uc.UrlType {
+	switch u.UrlType {
 	case UrlTypeFiles:
-		result = fmt.Sprintf("%s/files/%s?ref=%s", base, formattedPath, uc.Branch)
+		return fmt.Sprintf("%s/files/%s?ref=%s", base, formattedPath, u.Branch)
 	case UrlTypeTree:
-		result = fmt.Sprintf(
+		return fmt.Sprintf(
 			"%s/tree?path=%s&ref=%s&per_page=100&recursive=true",
 			base,
 			formattedPath,
-			uc.Branch,
+			u.Branch,
 		)
-	default:
-		return "", fmt.Errorf("invalid UrlType")
 	}
 
-	return result, nil
+	return ""
 }
 
-func (uc UrlConfig) Get() (*http.Response, error) {
-	u, err := uc.ToUrl()
-	if err != nil {
-		return nil, err
+func (u UrlConfig) Fetch(wg *sync.WaitGroup, ch chan<- FetchResult, namespace string) {
+	defer wg.Done()
+
+	resp, err := http.Get(u.url())
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return
 	}
+	defer resp.Body.Close()
 
-	resp, err := http.Get(u)
-	if err != nil {
-		return nil, err
-	}
+	result := FetchResult{Namespace: namespace}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to fetch file: %s", resp.Status)
-	}
-
-	return resp, nil
-}
-
-func (uc UrlConfig) FetchFiles(resp *http.Response) (string, error) {
-	content, err := handleFileResponse(resp)
-	if err != nil {
-		return "", err
-	}
-
-	return content, nil
-}
-
-func (uc UrlConfig) FetchTree(resp *http.Response) ([]string, error) {
-	files, err := handleTreeResponse(resp)
-	if err != nil {
-		return nil, err
-	}
-
-	var contents []string
-	for _, file := range files {
-		urlConfig := uc
-		urlConfig.UrlType = UrlTypeFiles
-		urlConfig.Path = file
-
-		resp, err := urlConfig.Get()
+	switch u.UrlType {
+	case UrlTypeFiles:
+		protocol, err := u.handleFile(resp)
 		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-
-		content, err := urlConfig.FetchFiles(resp)
-		if err != nil {
-			return nil, err
+			return
 		}
 
-		contents = append(contents, content)
+		result.Protocols = append(result.Protocols, protocol)
+
+	case UrlTypeTree:
+		filePaths, err := u.handleTree(resp)
+		if err != nil {
+			return
+		}
+
+		var fileWg sync.WaitGroup
+		fileCh := make(chan xmlparser.Protocol)
+
+		for _, path := range filePaths {
+			fileWg.Add(1)
+
+			fileUrlConfig := u
+			fileUrlConfig.UrlType = UrlTypeFiles
+			fileUrlConfig.Path = path
+
+			go func(cu UrlConfig, cwg *sync.WaitGroup, cch chan<- xmlparser.Protocol) {
+				defer cwg.Done()
+
+				resp, err := http.Get(cu.url())
+				if err != nil || resp.StatusCode != http.StatusOK {
+					return
+				}
+				defer resp.Body.Close()
+
+				protocol, err := cu.handleFile(resp)
+				if err != nil {
+					return
+				}
+
+				cch <- protocol
+			}(fileUrlConfig, &fileWg, fileCh)
+		}
+
+		go func() {
+			fileWg.Wait()
+			close(fileCh)
+		}()
+
+		for protocol := range fileCh {
+			result.Protocols = append(result.Protocols, protocol)
+		}
 	}
 
-	return contents, nil
+	ch <- result
 }
 
-func handleFileResponse(resp *http.Response) (string, error) {
-	var fileResp FileResponse
+func (u UrlConfig) handleFile(resp *http.Response) (xmlparser.Protocol, error) {
+	defer resp.Body.Close()
+
+	var fileResp fileResponse
 	if err := json.NewDecoder(resp.Body).Decode(&fileResp); err != nil {
-		return "", fmt.Errorf("failed to decode response: %v", err)
+		return xmlparser.Protocol{}, err
 	}
 
 	decodedContent, err := base64.StdEncoding.DecodeString(fileResp.Content)
 	if err != nil {
-		return "", fmt.Errorf("failed to decode file content: %v", err)
+		return xmlparser.Protocol{}, err
 	}
 
-	return string(decodedContent), nil
+	return xmlparser.ParseProtocol(decodedContent), nil
 }
 
-func handleTreeResponse(resp *http.Response) ([]string, error) {
-	var nodes []TreeResponse
+func (u UrlConfig) handleTree(resp *http.Response) ([]string, error) {
+	defer resp.Body.Close()
+
+	var nodes []treeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
 		return nil, err
 	}
 
-	var files []string
+	var filePaths []string
 	for _, node := range nodes {
 		if node.Type == "blob" && len(node.Path) > 4 && node.Path[len(node.Path)-4:] == ".xml" {
-			files = append(files, node.Path)
+			filePaths = append(filePaths, node.Path)
 		}
 	}
 
-	return files, nil
+	return filePaths, nil
 }
